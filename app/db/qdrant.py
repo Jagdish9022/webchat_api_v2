@@ -1,12 +1,14 @@
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct, OptimizersConfigDiff, CollectionStatus
-from typing import List
+from typing import List, Optional, Dict, Any
 import logging
 import os
 from dotenv import load_dotenv
 from datetime import datetime
+import time
 from tenacity import retry, stop_after_attempt, wait_exponential
 import google.generativeai as genai
+import json
 
 load_dotenv()
 
@@ -18,17 +20,49 @@ logger = logging.getLogger(__name__)
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 def get_qdrant_client() -> QdrantClient:
-    """Create and return a Qdrant client with proper configuration."""
+    """Create and return a Qdrant client with proper configuration for local or hosted setup."""
     try:
-        client = QdrantClient(
-            host=os.getenv("QDRANT_HOST", "localhost"),
-            port=int(os.getenv("QDRANT_PORT", 6333)),
-            timeout=60,
-            prefer_grpc=False  # Use HTTP instead of gRPC for better compatibility
-        )
+        # Check if using hosted or local Qdrant
+        use_hosted_qdrant = os.getenv("USE_HOSTED_QDRANT", "false").lower() == "true"
+        
+        if use_hosted_qdrant:
+            # Hosted Qdrant configuration (e.g., Qdrant Cloud)
+            api_key = os.getenv("HOSTED_QDRANT_API_KEY")
+            url = os.getenv("HOSTED_QDRANT_URL")
+            
+            if not url:
+                raise ValueError("HOSTED_QDRANT_URL is required when using hosted Qdrant")
+            
+            client_params = {
+                "url": url,
+                "timeout": 60,
+            }
+            
+            # Add API key if provided
+            if api_key:
+                client_params["api_key"] = api_key
+            
+            logger.info(f"Connecting to hosted Qdrant at {url}")
+            client = QdrantClient(**client_params)
+            
+        else:
+            # Local Qdrant configuration
+            host = os.getenv("LOCAL_QDRANT_HOST", "localhost")
+            port = int(os.getenv("LOCAL_QDRANT_PORT", "6333"))
+            
+            client = QdrantClient(
+                host=host,
+                port=port,
+                timeout=60,
+                prefer_grpc=False  # Use HTTP instead of gRPC for better compatibility
+            )
+            logger.info(f"Connecting to local Qdrant at {host}:{port}")
+        
         # Test connection
         client.get_collections()
+        logger.info(f"Successfully connected to {'hosted' if use_hosted_qdrant else 'local'} Qdrant server")
         return client
+        
     except Exception as e:
         logger.error(f"Failed to initialize Qdrant client: {e}")
         raise
@@ -36,7 +70,6 @@ def get_qdrant_client() -> QdrantClient:
 # Initialize Qdrant client
 try:
     qdrant = get_qdrant_client()
-    logger.info("Successfully connected to Qdrant server")
 except Exception as e:
     logger.error(f"Failed to connect to Qdrant server: {e}")
     raise
