@@ -20,19 +20,52 @@ logger = logging.getLogger(__name__)
 
 def get_db_connection(use_database=True):
     try:
-        connection_params = {
-            'host': os.getenv("DB_HOST", "localhost"),
-            'user': os.getenv("DB_USER", "root"),
-            'password': os.getenv("DB_PASSWORD", "Saish@05"),
-        }
+        # Check if using hosted or local database
+        use_hosted_db = os.getenv("USE_HOSTED_DB", "false").lower() == "true"
         
-        if use_database:
-            connection_params['database'] = os.getenv("DB_NAME", "webchat_db")
+        if use_hosted_db:
+            # Hosted database configuration
+            connection_params = {
+                'host': os.getenv("HOSTED_DB_HOST"),
+                'user': os.getenv("HOSTED_DB_USER"),
+                'password': os.getenv("HOSTED_DB_PASSWORD"),
+                'port': int(os.getenv("HOSTED_DB_PORT", "3306")),
+                'ssl_disabled': os.getenv("HOSTED_DB_SSL_DISABLED", "false").lower() == "true",
+            }
             
-        logger.info(f"Attempting to connect to MySQL {'database' if use_database else 'server'}...")
+            # Add SSL configuration if needed for hosted database
+            if not connection_params['ssl_disabled']:
+                connection_params['ssl_ca'] = os.getenv("HOSTED_DB_SSL_CA")
+                connection_params['ssl_cert'] = os.getenv("HOSTED_DB_SSL_CERT")
+                connection_params['ssl_key'] = os.getenv("HOSTED_DB_SSL_KEY")
+                # Remove None values
+                connection_params = {k: v for k, v in connection_params.items() if v is not None}
+            else:
+                connection_params.pop('ssl_disabled')
+            
+            if use_database:
+                connection_params['database'] = os.getenv("HOSTED_DB_NAME")
+                
+            logger.info(f"Attempting to connect to hosted MySQL {'database' if use_database else 'server'}...")
+            
+        else:
+            # Local database configuration
+            connection_params = {
+                'host': os.getenv("LOCAL_DB_HOST", "localhost"),
+                'user': os.getenv("LOCAL_DB_USER", "root"),
+                'password': os.getenv("LOCAL_DB_PASSWORD", "Saish@05"),
+                'port': int(os.getenv("LOCAL_DB_PORT", "3306")),
+            }
+            
+            if use_database:
+                connection_params['database'] = os.getenv("LOCAL_DB_NAME", "webchat_db")
+                
+            logger.info(f"Attempting to connect to local MySQL {'database' if use_database else 'server'}...")
+            
         connection = mysql.connector.connect(**connection_params)
-        logger.info(f"Successfully connected to MySQL {'database' if use_database else 'server'}")
+        logger.info(f"Successfully connected to {'hosted' if use_hosted_db else 'local'} MySQL {'database' if use_database else 'server'}")
         return connection
+        
     except Error as e:
         logger.error(f"Failed to connect to MySQL: {e}")
         raise e
@@ -46,8 +79,13 @@ def create_database():
         connection = get_db_connection(use_database=False)
         cursor = connection.cursor()
         
-        # Create database if it doesn't exist
-        db_name = os.getenv("DB_NAME", "webchat_db")
+        # Get database name based on configuration
+        use_hosted_db = os.getenv("USE_HOSTED_DB", "false").lower() == "true"
+        if use_hosted_db:
+            db_name = os.getenv("HOSTED_DB_NAME")
+        else:
+            db_name = os.getenv("LOCAL_DB_NAME", "webchat_db")
+        
         logger.info(f"Creating database '{db_name}' if it doesn't exist...")
         cursor.execute(f"CREATE DATABASE IF NOT EXISTS {db_name}")
         connection.commit()
@@ -112,32 +150,4 @@ def get_db():
     finally:
         if connection.is_connected():
             connection.close()
-            # logger.info("Database connection closed") 
-
-def get_user_by_email(db, email: str):
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
-    user = cursor.fetchone()
-    cursor.close()
-    return user
-
-def get_user_by_id(db, user_id: str):
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-    user = cursor.fetchone()
-    cursor.close()
-    return user
-
-def create_user(db, user_data: dict):
-    cursor = db.cursor()
-    cursor.execute("""
-        INSERT INTO users (id, email, username, password_hash)
-        VALUES (%s, %s, %s, %s)
-    """, (
-        user_data['id'],
-        user_data['email'],
-        user_data['username'],
-        user_data['password_hash']
-    ))
-    db.commit()
-    cursor.close()
+            # logger.info("Database connection closed")
