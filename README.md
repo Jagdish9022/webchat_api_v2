@@ -51,9 +51,43 @@ An intelligent chatbot that scrapes websites and answers questions using vector 
 4. **Set up environment variables**
    Create a `.env` file in the root directory:
    ```env
-   GEMINI_API_KEY=your_gemini_api_key_here
-   QDRANT_HOST=localhost
-   QDRANT_PORT=6333
+# Database Configuration
+# Set to 'true' to use hosted database, 'false' for local
+USE_HOSTED_DB=false
+ 
+# Local MySQL Database Configuration
+LOCAL_DB_HOST=localhost
+LOCAL_DB_USER=root
+LOCAL_DB_PASSWORD=8767
+LOCAL_DB_NAME=chatbot_db
+LOCAL_DB_PORT=3306
+ 
+# Hosted MySQL Database Configuration (e.g., AWS RDS, Google Cloud SQL, etc.)
+HOSTED_DB_HOST=your-hosted-db-host.com
+HOSTED_DB_USER=your-hosted-db-user
+HOSTED_DB_PASSWORD=your-hosted-db-password
+HOSTED_DB_NAME=your-hosted-db-name
+HOSTED_DB_PORT=3306
+HOSTED_DB_SSL_DISABLED=false
+HOSTED_DB_SSL_CA=path/to/ca-cert.pem
+HOSTED_DB_SSL_CERT=path/to/client-cert.pem
+HOSTED_DB_SSL_KEY=path/to/client-key.pem
+ 
+# Qdrant Configuration
+# Set to 'true' to use hosted Qdrant, 'false' for local
+USE_HOSTED_QDRANT=false
+ 
+# Local Qdrant Configuration
+LOCAL_QDRANT_HOST=localhost
+LOCAL_QDRANT_PORT=6333
+ 
+# Hosted Qdrant Configuration (e.g., Qdrant Cloud)
+HOSTED_QDRANT_URL=https://your-cluster-url.qdrant.tech
+HOSTED_QDRANT_API_KEY=your-qdrant-api-key
+ 
+# API Keys
+GEMINI_API_KEY=AIzaSyDwc5LKIj96RlqXZ_C77niPdA2v9JUV7Fc
+JWT_SECRET_KEY=your_secret_key
    ```
 
 5. **Start Qdrant database**
