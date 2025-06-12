@@ -21,6 +21,8 @@ import hashlib
 import uuid
 import traceback
 import json
+from collections import defaultdict
+from fastapi.concurrency import run_in_threadpool
 
 
 # Configure logging
@@ -29,8 +31,14 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Store scraping progress with last update time
-scraping_progress: Dict[str, dict] = {}
+# Store scraping progress with last update time - now user-specific
+scraping_progress: Dict[str, Dict[str, dict]] = defaultdict(dict)
+
+# Store active scraping tasks per user
+active_tasks: Dict[str, set] = defaultdict(set)
+
+# Maximum concurrent scraping tasks per user
+MAX_CONCURRENT_TASKS = 3
 
 # Allowed file types
 ALLOWED_EXTENSIONS = {
@@ -304,104 +312,138 @@ async def scrape_and_ingest(
     try:
         # Use user's ID as collection name
         collection_name = current_user['id']
+        user_id = current_user['id']
         
-        logger.info(f"Starting scrape and ingest for URL: {req.url}")
+        logger.info(f"Starting scrape and ingest for URL: {req.url} by user: {user_id}")
+        
+        # Check if user has reached maximum concurrent tasks
+        if len(active_tasks[user_id]) >= MAX_CONCURRENT_TASKS:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Maximum concurrent scraping tasks ({MAX_CONCURRENT_TASKS}) reached. Please wait for some tasks to complete."
+            )
         
         # Generate a unique ID for this scraping task
-        task_id = hashlib.md5(f"{req.url}_{datetime.now().timestamp()}".encode()).hexdigest()
+        task_id = hashlib.md5(f"{req.url}_{datetime.now().timestamp()}_{user_id}".encode()).hexdigest()
         
-        # Initialize progress tracking
-        scraping_progress[task_id] = {
+        # Initialize progress tracking for this user's task
+        scraping_progress[user_id][task_id] = {
             "status": "crawling",
             "start_time": datetime.now(),
             "last_update": datetime.now(),
             "pages_scraped": 0,
             "chunks_created": 0,
             "error": None,
-            "is_completed": False
+            "is_completed": False,
+            "url": req.url
         }
         
+        # Add task to user's active tasks
+        active_tasks[user_id].add(task_id)
+        
         # Start background task
-        background_tasks.add_task(process_scraping, req.url, task_id, collection_name)
+        background_tasks.add_task(process_scraping, req.url, task_id, collection_name, user_id)
         
         return {"task_id": task_id, "status": "started"}
         
+    except HTTPException as he:
+        raise he
     except Exception as e:
         logger.error(f"Error starting scrape process: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/scraping-progress/{task_id}")
-async def get_scraping_progress(task_id: str):
+async def get_scraping_progress(
+    task_id: str,
+    current_user = Depends(get_current_active_user)
+):
     """Get the current progress of a scraping task."""
-    if task_id not in scraping_progress:
+    user_id = current_user['id']
+    
+    if task_id not in scraping_progress[user_id]:
         raise HTTPException(status_code=404, detail="Task not found")
     
     # Check if we should return cached response
     current_time = datetime.now()
-    last_update = scraping_progress[task_id]["last_update"]
+    last_update = scraping_progress[user_id][task_id]["last_update"]
     time_diff = (current_time - last_update).total_seconds()
     
     # If the task is completed or there's an error, return immediately
-    if scraping_progress[task_id]["is_completed"] or scraping_progress[task_id]["error"]:
-        return scraping_progress[task_id]
+    if scraping_progress[user_id][task_id]["is_completed"] or scraping_progress[user_id][task_id]["error"]:
+        return scraping_progress[user_id][task_id]
     
     # If less than 2 seconds have passed since last update, return cached response
     if time_diff < 2:
-        return scraping_progress[task_id]
+        return scraping_progress[user_id][task_id]
     
     # Update last update time
-    scraping_progress[task_id]["last_update"] = current_time
-    return scraping_progress[task_id]
+    scraping_progress[user_id][task_id]["last_update"] = current_time
+    return scraping_progress[user_id][task_id]
 
-async def process_scraping(url: str, task_id: str, collection_name: str):
+async def process_scraping(url: str, task_id: str, collection_name: str, user_id: str):
     """Background task to process scraping and ingestion."""
     try:
         # Update status to crawling
-        update_progress(task_id, "crawling")
+        update_progress(user_id, task_id, "crawling")
         
-        # Crawl the website WITHOUT LIMIT - will crawl all pages
-        pages = crawl_website(str(url), max_pages=None)  # None means unlimited
+        # Run crawling in a thread pool to prevent blocking
+        pages = await run_in_threadpool(lambda: asyncio.run(crawl_website(str(url), max_pages=None)))
         
         if not pages:
-            update_progress(task_id, "error", error="No pages could be scraped from the provided URL")
+            update_progress(user_id, task_id, "error", error="No pages could be scraped from the provided URL")
             return
         
-        update_progress(task_id, "crawling", pages_scraped=len(pages))
+        update_progress(user_id, task_id, "crawling", pages_scraped=len(pages))
         
         # Update status to processing
-        update_progress(task_id, "processing")
+        update_progress(user_id, task_id, "processing")
         
+        # Process pages in chunks to prevent memory issues
+        chunk_size = 5
         all_chunks = []
         
-        # Process each page
-        for url, html in pages.items():
-            if html and isinstance(html, str) and len(html) > 0:
-                cleaned_text = clean_text(html)
-                if cleaned_text.strip():
-                    # Create chunks with size 64
-                    chunks = create_chunks(cleaned_text, chunk_size=64, overlap=10)
-                    all_chunks.extend(chunks)
+        for i in range(0, len(pages), chunk_size):
+            page_chunk = dict(list(pages.items())[i:i + chunk_size])
+            
+            # Process each page in the chunk
+            for url, html in page_chunk.items():
+                if html and isinstance(html, str) and len(html) > 0:
+                    cleaned_text = clean_text(html)
+                    if cleaned_text.strip():
+                        # Create chunks with size 64
+                        chunks = create_chunks(cleaned_text, chunk_size=64, overlap=10)
+                        all_chunks.extend(chunks)
+            
+            # Update progress after each chunk
+            update_progress(user_id, task_id, "processing", chunks_created=len(all_chunks))
         
         if not all_chunks:
-            update_progress(task_id, "error", error="No valid text content found to ingest from the website")
+            update_progress(user_id, task_id, "error", error="No valid text content found to ingest from the website")
             return
         
-        update_progress(task_id, "processing", chunks_created=len(all_chunks))
-        
         # Update status to generating embeddings
-        update_progress(task_id, "generating_embeddings")
+        update_progress(user_id, task_id, "generating_embeddings")
         
-        # Generate embeddings
-        embeddings = get_embeddings(all_chunks)
+        # Generate embeddings in chunks to prevent memory issues
+        all_embeddings = []
+        embedding_chunk_size = 50
+        
+        for i in range(0, len(all_chunks), embedding_chunk_size):
+            chunk = all_chunks[i:i + embedding_chunk_size]
+            embeddings = await run_in_threadpool(lambda: get_embeddings(chunk))
+            all_embeddings.extend(embeddings)
         
         # Update status to storing
-        update_progress(task_id, "storing")
+        update_progress(user_id, task_id, "storing")
         
-        # Ingest to Qdrant using user's collection
-        ingest_to_qdrant(collection_name, all_chunks, embeddings)
+        # Ingest to Qdrant in chunks
+        for i in range(0, len(all_chunks), embedding_chunk_size):
+            chunk = all_chunks[i:i + embedding_chunk_size]
+            embeddings = all_embeddings[i:i + embedding_chunk_size]
+            await run_in_threadpool(lambda: ingest_to_qdrant(collection_name, chunk, embeddings))
         
         # Update status to completed
-        update_progress(task_id, "completed", 
+        update_progress(user_id, task_id, "completed", 
                        result={
                            "collection_name": collection_name,
                            "pages_scraped": len(pages),
@@ -410,21 +452,24 @@ async def process_scraping(url: str, task_id: str, collection_name: str):
         
     except Exception as e:
         logger.error(f"Error in scraping process: {e}")
-        update_progress(task_id, "error", error=str(e))
+        update_progress(user_id, task_id, "error", error=str(e))
+    finally:
+        # Remove task from active tasks
+        active_tasks[user_id].discard(task_id)
 
-def update_progress(task_id: str, status: str, **kwargs):
+def update_progress(user_id: str, task_id: str, status: str, **kwargs):
     """Update progress with new status and optional data."""
-    if task_id not in scraping_progress:
+    if task_id not in scraping_progress[user_id]:
         return
         
-    scraping_progress[task_id].update({
+    scraping_progress[user_id][task_id].update({
         "status": status,
         "last_update": datetime.now(),
         **kwargs
     })
     
     if status in ["completed", "error"]:
-        scraping_progress[task_id]["is_completed"] = True
+        scraping_progress[user_id][task_id]["is_completed"] = True
 
 
 @router.post("/ask-question")
