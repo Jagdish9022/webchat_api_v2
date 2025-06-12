@@ -5,21 +5,45 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from urllib.parse import urljoin, urlparse
 import warnings
 import logging
-from typing import Dict, List
+from typing import Dict, List, Set
+import asyncio
+import aiohttp
+from aiohttp import ClientTimeout
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
-def scrape_url(url: str) -> str:
-    """Scrape content from a single URL."""
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global rate limiting
+RATE_LIMIT = 2  # requests per second
+last_request_time = 0
+
+# Thread pool for CPU-bound operations
+thread_pool = ThreadPoolExecutor(max_workers=4)
+
+async def rate_limit():
+    """Implement rate limiting to avoid overwhelming servers."""
+    global last_request_time
+    current_time = time.time()
+    time_since_last = current_time - last_request_time
+    if time_since_last < 1.0 / RATE_LIMIT:
+        await asyncio.sleep(1.0 / RATE_LIMIT - time_since_last)
+    last_request_time = time.time()
+
+async def scrape_url_async(session: aiohttp.ClientSession, url: str) -> str:
+    """Scrape content from a single URL asynchronously."""
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        response = requests.get(url, timeout=10, headers=headers)
-        response.raise_for_status()
-        return response.text
+        await rate_limit()
+        async with session.get(url, timeout=ClientTimeout(total=10)) as response:
+            if response.status == 200:
+                return await response.text()
+            return ""
     except Exception as e:
-        logging.error(f"Failed to scrape {url}: {e}")
+        logger.error(f"Failed to scrape {url}: {e}")
         return ""
 
 def clean_text(html: str) -> str:
@@ -42,65 +66,74 @@ def clean_text(html: str) -> str:
         
         return "\n".join(clean_texts)
     except Exception as e:
-        logging.error(f"Failed to clean text: {e}")
+        logger.error(f"Failed to clean text: {e}")
         return ""
 
-def crawl_website(start_url: str, max_pages: int = None) -> Dict[str, str]:
-    """Crawl a website starting from the given URL. If max_pages is None, crawl all pages."""
-    visited = set()
-    data = {}
-    urls_to_visit = [start_url]
+async def crawl_website_async(start_url: str, max_pages: int = None) -> Dict[str, str]:
+    """Crawl a website starting from the given URL asynchronously."""
+    visited: Set[str] = set()
+    data: Dict[str, str] = {}
+    urls_to_visit: List[str] = [start_url]
     
-    while urls_to_visit:
-        # If max_pages is set and we've reached the limit, stop
-        if max_pages is not None and len(visited) >= max_pages:
-            break
-            
-        current_url = urls_to_visit.pop(0)
-        
-        if current_url in visited:
-            continue
-            
-        try:
-            logging.info(f"Crawling: {current_url} (Total crawled: {len(visited)})")
-            html = scrape_url(current_url)
-            
-            if not html:
-                continue
+    # Configure aiohttp session with custom headers and connection pooling
+    connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+    timeout = ClientTimeout(total=30)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+    
+    async with aiohttp.ClientSession(headers=headers, connector=connector, timeout=timeout) as session:
+        while urls_to_visit:
+            # If max_pages is set and we've reached the limit, stop
+            if max_pages is not None and len(visited) >= max_pages:
+                break
                 
-            # Check if it's HTML content
-            try:
-                response_check = requests.head(current_url, timeout=5)
-                content_type = response_check.headers.get("Content-Type", "")
-                if "text/html" not in content_type:
+            # Process URLs in batches for better concurrency
+            batch_size = min(5, len(urls_to_visit))  # Process up to 5 URLs concurrently
+            current_batch = urls_to_visit[:batch_size]
+            urls_to_visit = urls_to_visit[batch_size:]
+            
+            # Create tasks for the current batch
+            tasks = []
+            for url in current_batch:
+                if url not in visited:
+                    tasks.append(scrape_url_async(session, url))
+            
+            # Wait for all tasks in the batch to complete
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Process results
+            for url, html in zip(current_batch, results):
+                if isinstance(html, Exception):
+                    logger.error(f"Error crawling {url}: {html}")
                     continue
-            except:
-                # If head request fails, assume it's HTML and continue
-                pass
-                
-            visited.add(current_url)
-            data[current_url] = html
-            
-            # Extract links for further crawling
-            soup = BeautifulSoup(html, "html.parser")
-            for link in soup.find_all("a", href=True):
-                full_url = urljoin(current_url, link["href"])
-                
-                # Only crawl links from the same domain
-                if (urlparse(full_url).netloc == urlparse(start_url).netloc 
-                    and full_url not in visited 
-                    and full_url not in urls_to_visit):
                     
-                    # Skip certain file types and fragments
-                    if not should_skip_url(full_url):
-                        urls_to_visit.append(full_url)
+                if not html:
+                    continue
                     
-        except Exception as e:
-            logging.error(f"Error crawling {current_url}: {e}")
-            continue
+                visited.add(url)
+                data[url] = html
+                
+                # Extract links for further crawling
+                soup = BeautifulSoup(html, "html.parser")
+                for link in soup.find_all("a", href=True):
+                    full_url = urljoin(url, link["href"])
+                    
+                    # Only crawl links from the same domain
+                    if (urlparse(full_url).netloc == urlparse(start_url).netloc 
+                        and full_url not in visited 
+                        and full_url not in urls_to_visit):
+                        
+                        # Skip certain file types and fragments
+                        if not should_skip_url(full_url):
+                            urls_to_visit.append(full_url)
     
-    logging.info(f"Crawling completed. Total pages crawled: {len(data)}")
+    logger.info(f"Crawling completed. Total pages crawled: {len(data)}")
     return data
+
+async def crawl_website(start_url: str, max_pages: int = None) -> Dict[str, str]:
+    """Async wrapper for website crawling."""
+    return await crawl_website_async(start_url, max_pages)
 
 def should_skip_url(url: str) -> bool:
     """Check if URL should be skipped based on file extension or other criteria."""
@@ -120,7 +153,6 @@ def should_skip_url(url: str) -> bool:
             return True
     
     return False
-
 
 def preprocess_text(text: str) -> str:
     """Preprocess text to ensure it's clean and properly formatted."""
